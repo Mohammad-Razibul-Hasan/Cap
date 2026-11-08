@@ -3,19 +3,98 @@
 //! (lid closed, Sleep chosen, battery empty) the recording is paused first, so
 //! capture never dies inside sleep, and it waits paused for the user on wake.
 
+use std::time::{Duration, Instant};
+
+use cap_recording::upload_probe::{
+    CALIBRATION_PROBE_BYTES, DEFAULT_PROBE_PAYLOAD_BYTES, SpeedProbeSample, build_probe_payload,
+    record_startup_health, should_run_speed_probe,
+};
 use gpui::App;
 
-use crate::session::Phase;
+use crate::session::{Phase, RecordingSession};
+
+struct ProbeEndpoint<'a> {
+    client: &'a reqwest::Client,
+    url: &'a str,
+    token: &'a str,
+}
 
 pub(crate) fn holds_off_idle_sleep(phase: Phase) -> bool {
     phase != Phase::Idle
 }
 
 pub fn install(cx: &mut App) {
+    spawn_startup_upload_probe(cx);
     #[cfg(target_os = "macos")]
     macos::install(cx);
     #[cfg(not(target_os = "macos"))]
     let _ = cx;
+}
+
+fn spawn_startup_upload_probe(cx: &mut App) {
+    let phase = RecordingSession::global(cx).read(cx).phase;
+    let recording_active = holds_off_idle_sleep(phase);
+    if !should_run_speed_probe(recording_active) {
+        return;
+    }
+    gpui_tokio::Tokio::spawn(cx, run_startup_upload_probe()).detach();
+}
+
+async fn check_storage_ready(endpoint: &ProbeEndpoint<'_>) -> bool {
+    let req = crate::auth::apply_desktop_headers(endpoint.client.get(endpoint.url))
+        .bearer_auth(endpoint.token);
+    req.send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn measure_probe_post(endpoint: &ProbeEndpoint<'_>, payload_bytes: usize) -> Option<Duration> {
+    let payload = build_probe_payload(payload_bytes);
+    let started = Instant::now();
+    let req = crate::auth::apply_desktop_headers(endpoint.client.post(endpoint.url))
+        .bearer_auth(endpoint.token)
+        .header("Content-Type", "application/octet-stream")
+        .body(payload);
+    let resp = req.send().await.ok()?;
+    resp.status().is_success().then(|| started.elapsed())
+}
+
+async fn run_startup_upload_probe() {
+    let auth = crate::store::auth_snapshot();
+    let Some(token) = auth.token.filter(|token| !token.is_empty()) else {
+        return;
+    };
+    let Ok(client) = crate::auth::api_client() else {
+        return;
+    };
+    let server = crate::auth::server_url();
+    let health_url = format!("{server}/api/upload/health-check");
+    let endpoint = ProbeEndpoint {
+        client: &client,
+        url: &health_url,
+        token: &token,
+    };
+
+    if !check_storage_ready(&endpoint).await {
+        record_startup_health(false, None);
+        return;
+    }
+    let Some(baseline_overhead) = measure_probe_post(&endpoint, CALIBRATION_PROBE_BYTES).await else {
+        record_startup_health(false, None);
+        return;
+    };
+    let sample = measure_probe_post(&endpoint, DEFAULT_PROBE_PAYLOAD_BYTES)
+        .await
+        .map(|upload_elapsed| {
+            SpeedProbeSample::from_differential(
+                DEFAULT_PROBE_PAYLOAD_BYTES,
+                CALIBRATION_PROBE_BYTES,
+                upload_elapsed,
+                baseline_overhead,
+            )
+        });
+    record_startup_health(true, sample);
 }
 
 #[cfg(target_os = "macos")]
